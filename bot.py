@@ -206,13 +206,10 @@ class Rpc:
                 await asyncio.sleep(1.5 * (attempt + 1))
         return None
 
-    async def prior_signatures(self, address: str, before: str, limit: int):
-        """Signatures for `address` strictly BEFORE the given tx signature.
+    async def recent_signatures(self, address: str, limit: int):
+        """Most recent signatures for `address` (newest first).
         Returns a list of signature strings, or None on RPC failure."""
-        params = [
-            address,
-            {"limit": limit, "before": before, "commitment": "confirmed"},
-        ]
+        params = [address, {"limit": limit, "commitment": "confirmed"}]
         result = await self.call("getSignaturesForAddress", params)
         if result is None:
             return None
@@ -389,20 +386,38 @@ async def handle_event(event: dict, store: Store, rpc: Rpc,
         return
 
     # --- Freshness check -------------------------------------------------
-    sigs = await rpc.prior_signatures(
-        creator, before=signature, limit=cfg.fresh_max_prior_txs + 1
-    )
-    if sigs is None:
-        log.warning("RPC failed for creator %s, skipping %s", creator[:8], mint)
+    # Fetch the creator's recent signatures (newest first) and locate the
+    # create tx among them; everything AFTER it in the list is a prior tx.
+    # We anchor this way instead of using the RPC `before=` parameter,
+    # because `before=<sig>` silently returns an EMPTY list when the node
+    # hasn't indexed <sig> yet - which looks exactly like a fresh wallet
+    # and produces false prior=0 results.
+    page_limit = cfg.fresh_max_prior_txs + 5
+    sigs = None
+    create_index = None
+    for attempt in range(4):
+        sigs = await rpc.recent_signatures(creator, page_limit)
+        if sigs is None:
+            log.warning("RPC failed for creator %s, skipping %s", creator[:8], mint)
+            return
+        if signature in sigs:
+            create_index = sigs.index(signature)
+            break
+        # Node hasn't indexed the create tx yet - give it a moment.
+        await asyncio.sleep(1.5 * (attempt + 1))
+    if create_index is None:
+        log.warning("Create tx for %s not indexed after retries - "
+                    "cannot verify freshness, skipping", mint)
         return
 
-    prior_count = len(sigs)
+    prior_sigs = sigs[create_index + 1:]
+    prior_count = len(prior_sigs)
     if prior_count > cfg.fresh_max_prior_txs:
         log.debug("Skip %s: creator has >%d prior txs", mint, cfg.fresh_max_prior_txs)
         return
 
     if cfg.check_pumpfun_history and prior_count > 0:
-        for sig in sigs:
+        for sig in prior_sigs:
             touched = await rpc.tx_touches_program(sig, PUMP_FUN_PROGRAM)
             if touched:
                 log.info("Skip %s: creator %s touched pump.fun before",
@@ -465,13 +480,10 @@ async def ws_loop(events: asyncio.Queue, cfg: Config):
 
 
 # --------------------------------------------------------------------------
-# Entrypoint
+# Optional keep-alive web server
+# (for hosts like Render that require an open HTTP port on web services)
 # --------------------------------------------------------------------------
 
-# Health-check endpoint: replies "ok" to any GET request.
-# Render requires web services to listen on a port, and UptimeRobot
-# pings this URL to stop the free instance from sleeping.
-# Runs beside the bot — never touches the detection logic.
 async def start_keepalive_server(port: int):
     from aiohttp import web
 
@@ -485,6 +497,11 @@ async def start_keepalive_server(port: int):
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
     log.info("Keep-alive HTTP server listening on port %d", port)
+
+
+# --------------------------------------------------------------------------
+# Entrypoint
+# --------------------------------------------------------------------------
 
 async def main():
     cfg = Config()
@@ -507,8 +524,8 @@ async def main():
             cfg.alert_queue_size,
         )
 
-        # Render injects a PORT env var and expects us to listen on it.
-# On machines without PORT (Mac, EC2), this does nothing.
+        # Hosting platforms like Render set PORT and expect something to be
+        # listening on it. Harmless everywhere else (Mac, EC2: no PORT set).
         port = os.environ.get("PORT")
         if port:
             try:
