@@ -468,6 +468,24 @@ async def ws_loop(events: asyncio.Queue, cfg: Config):
 # Entrypoint
 # --------------------------------------------------------------------------
 
+# Health-check endpoint: replies "ok" to any GET request.
+# Render requires web services to listen on a port, and UptimeRobot
+# pings this URL to stop the free instance from sleeping.
+# Runs beside the bot — never touches the detection logic.
+async def start_keepalive_server(port: int):
+    from aiohttp import web
+
+    async def ok(_request):
+        return web.Response(text="ok")
+
+    app = web.Application()
+    app.router.add_get("/", ok)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    log.info("Keep-alive HTTP server listening on port %d", port)
+
 async def main():
     cfg = Config()
     logging.basicConfig(
@@ -488,6 +506,15 @@ async def main():
             cfg.alert_min_interval,
             cfg.alert_queue_size,
         )
+
+        # Render injects a PORT env var and expects us to listen on it.
+# On machines without PORT (Mac, EC2), this does nothing.
+        port = os.environ.get("PORT")
+        if port:
+            try:
+                await start_keepalive_server(int(port))
+            except Exception:
+                log.exception("Keep-alive server failed to start")
 
         tasks = [asyncio.create_task(telegram.run(), name="telegram-sender")]
         for i in range(max(1, cfg.workers)):
