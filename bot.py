@@ -47,6 +47,9 @@ except ImportError:
 log = logging.getLogger("freshbot")
 
 PUMP_FUN_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+# pump.fun mayhem mode routes vaults/fees through this program (set at
+# creation, immutable) - its presence in the create tx marks a mayhem launch
+MAYHEM_PROGRAM = "MAyhSmzXzV1pTf7LsNkrNwkWKTo4ougAJ1PPg47MD4e"
 PUMP_VIRTUAL_SOL_RESERVE = 30.0  # bonding curve starts with 30 virtual SOL
 
 
@@ -104,6 +107,10 @@ class Config:
         # Suppress a launch if its (normalized) name already launched this
         # many times in the last 24h. 0 disables the skip (flag only).
         self.name_repeat_skip = _env_int("NAME_REPEAT_SKIP", 3)
+
+        # Skip launches created in pump.fun mayhem mode (AI-agent-traded
+        # first 24h, 2B supply) - detected from the create transaction.
+        self.skip_mayhem_mode = _env_bool("SKIP_MAYHEM_MODE", True)
 
         # Noise controls
         self.min_dev_buy_sol = _env_float("MIN_DEV_BUY_SOL", 0.0)
@@ -576,6 +583,11 @@ async def handle_event(event: dict, store: Store, rpc: Rpc,
     if cfg.pools and pool not in cfg.pools:
         return
 
+    # Free fast-path: if the feed ever labels mayhem launches directly.
+    if cfg.skip_mayhem_mode and event.get("mayhemMode"):
+        log.info("Skip %s: launched in mayhem mode (feed flag)", mint)
+        return
+
     if store.mint_alerted(mint):
         return
 
@@ -643,6 +655,18 @@ async def handle_event(event: dict, store: Store, rpc: Rpc,
     if prior_count > cfg.fresh_max_prior_txs:
         log.debug("Skip %s: creator has >%d prior txs", mint, cfg.fresh_max_prior_txs)
         return
+
+    # --- Mayhem-mode filter ----------------------------------------------
+    # Mayhem launches route through the Mayhem program; since the mode is
+    # fixed at creation, the create tx must list that program's ID.
+    if cfg.skip_mayhem_mode:
+        create_tx = await rpc.get_transaction(signature)
+        if create_tx is None:
+            log.debug("Could not fetch create tx for %s (mayhem check skipped)",
+                      mint)
+        elif tx_includes_program(create_tx, MAYHEM_PROGRAM):
+            log.info("Skip %s: launched in mayhem mode", mint)
+            return
 
     prior_txs = {}
     if cfg.check_pumpfun_history and prior_count > 0:

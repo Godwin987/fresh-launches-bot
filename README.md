@@ -29,6 +29,12 @@ launches are suppressed (`SKIP_FACTORY_FUNDED`). The funder graph lives in
 SQLite and gets smarter the longer it runs — note that on hosts without a
 persistent disk (e.g. Render free tier) it resets on each deploy.
 
+**Mayhem-mode filter (v2):** pump.fun's mayhem mode has an AI agent trade
+the coin's first 24h on a doubled (2B) supply, so the early tape is partly
+synthetic. Mayhem is fixed at creation and routes through its own on-chain
+program, so the bot checks each create transaction for the Mayhem program
+ID and suppresses those launches (`SKIP_MAYHEM_MODE`).
+
 **Copycat names (v2):** every launch name is normalized and logged; a name
 that already launched 3+ times in 24h is metaspam and gets suppressed
 (`NAME_REPEAT_SKIP`), while a single repeat is flagged in the alert.
