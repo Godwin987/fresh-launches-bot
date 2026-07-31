@@ -30,6 +30,7 @@ import html
 import json
 import logging
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -94,6 +95,16 @@ class Config:
         # wallet if any touched the pump.fun program (bought/launched before).
         self.check_pumpfun_history = _env_bool("CHECK_PUMPFUN_HISTORY", True)
 
+        # Funding-provenance controls: the funder is whoever sent the fresh
+        # wallet its SOL. If one funder has bankrolled this many creator
+        # wallets, treat it as a launch factory.
+        self.funder_factory_threshold = _env_int("FUNDER_FACTORY_THRESHOLD", 2)
+        self.skip_factory_funded = _env_bool("SKIP_FACTORY_FUNDED", True)
+
+        # Suppress a launch if its (normalized) name already launched this
+        # many times in the last 24h. 0 disables the skip (flag only).
+        self.name_repeat_skip = _env_int("NAME_REPEAT_SKIP", 3)
+
         # Noise controls
         self.min_dev_buy_sol = _env_float("MIN_DEV_BUY_SOL", 0.0)
         self.pools = {
@@ -108,6 +119,11 @@ class Config:
         self.alert_min_interval = _env_float("ALERT_MIN_INTERVAL", 3.0)
         self.alert_queue_size = _env_int("ALERT_QUEUE_SIZE", 25)
         self.event_queue_size = _env_int("EVENT_QUEUE_SIZE", 300)
+        # Reconnect if the feed sends nothing for this many seconds
+        # (pump.fun launches nonstop, so silence means a dead connection).
+        self.ws_silence_timeout = _env_int("WS_SILENCE_TIMEOUT", 120)
+        # Log a liveness line this often so "is it running?" is answerable.
+        self.heartbeat_secs = _env_int("HEARTBEAT_SECS", 180)
         self.log_level = _env_str("LOG_LEVEL", "INFO").upper()
 
     def validate(self):
@@ -139,6 +155,16 @@ class Store:
             "CREATE TABLE IF NOT EXISTS alerted ("
             " mint TEXT PRIMARY KEY, ts INTEGER)"
         )
+        self.db.execute(
+            "CREATE TABLE IF NOT EXISTS funders ("
+            " funder TEXT, creator TEXT, ts INTEGER,"
+            " PRIMARY KEY (funder, creator))"
+        )
+        self.db.execute(
+            "CREATE TABLE IF NOT EXISTS names ("
+            " name TEXT, mint TEXT, ts INTEGER)"
+        )
+        self.db.execute("CREATE INDEX IF NOT EXISTS idx_names ON names (name)")
         self.db.commit()
 
     def creator_seen(self, address: str) -> bool:
@@ -166,6 +192,39 @@ class Store:
             (mint, int(time.time())),
         )
         self.db.commit()
+
+    def record_funder(self, funder: str, creator: str) -> int:
+        """Remember that `funder` bankrolled `creator`. Returns how many
+        distinct creator wallets this funder has bankrolled in total -
+        this is the launch-factory detector."""
+        self.db.execute(
+            "INSERT OR IGNORE INTO funders (funder, creator, ts) VALUES (?, ?, ?)",
+            (funder, creator, int(time.time())),
+        )
+        self.db.commit()
+        row = self.db.execute(
+            "SELECT COUNT(DISTINCT creator) FROM funders WHERE funder = ?",
+            (funder,),
+        ).fetchone()
+        return int(row[0]) if row else 1
+
+    def record_name(self, name_norm: str, mint: str):
+        """Log a launch name (normalized) and prune entries older than 24h."""
+        now = int(time.time())
+        self.db.execute("DELETE FROM names WHERE ts < ?", (now - 86400,))
+        self.db.execute(
+            "INSERT INTO names (name, mint, ts) VALUES (?, ?, ?)",
+            (name_norm, mint, now),
+        )
+        self.db.commit()
+
+    def name_repeats(self, name_norm: str, mint: str) -> int:
+        """How many OTHER launches used this name in the last 24h."""
+        row = self.db.execute(
+            "SELECT COUNT(*) FROM names WHERE name = ? AND mint != ?",
+            (name_norm, mint),
+        ).fetchone()
+        return int(row[0]) if row else 0
 
 
 # --------------------------------------------------------------------------
@@ -207,22 +266,22 @@ class Rpc:
         return None
 
     async def recent_signatures(self, address: str, limit: int):
-        """Most recent signatures for `address` (newest first).
-        Returns a list of signature strings, or None on RPC failure."""
+        """Most recent transaction entries for `address` (newest first).
+        Each entry is a dict with at least `signature`, usually also
+        `blockTime`. Returns None on RPC failure."""
         params = [address, {"limit": limit, "commitment": "confirmed"}]
         result = await self.call("getSignaturesForAddress", params)
         if result is None:
             return None
         return [
-            item.get("signature")
+            item
             for item in result
             if isinstance(item, dict) and item.get("signature")
         ]
 
-    async def tx_touches_program(self, signature: str, program_id: str):
-        """True/False if the tx includes `program_id` in its account keys.
-        Returns None if the tx could not be fetched."""
-        result = await self.call(
+    async def get_transaction(self, signature: str):
+        """Fetch a confirmed transaction, or None on failure."""
+        return await self.call(
             "getTransaction",
             [
                 signature,
@@ -233,16 +292,75 @@ class Rpc:
                 },
             ],
         )
-        if not isinstance(result, dict):
-            return None
-        keys = []
-        message = (result.get("transaction") or {}).get("message") or {}
-        for key in message.get("accountKeys") or []:
-            keys.append(key.get("pubkey") if isinstance(key, dict) else key)
-        loaded = (result.get("meta") or {}).get("loadedAddresses") or {}
-        keys.extend(loaded.get("writable") or [])
-        keys.extend(loaded.get("readonly") or [])
-        return program_id in keys
+
+
+def tx_account_keys(tx: dict) -> list:
+    """All account keys of a fetched tx (static + address-table loaded),
+    index-aligned with meta.preBalances / meta.postBalances."""
+    keys = []
+    message = (tx.get("transaction") or {}).get("message") or {}
+    for key in message.get("accountKeys") or []:
+        keys.append(key.get("pubkey") if isinstance(key, dict) else key)
+    loaded = (tx.get("meta") or {}).get("loadedAddresses") or {}
+    keys.extend(loaded.get("writable") or [])
+    keys.extend(loaded.get("readonly") or [])
+    return keys
+
+
+def tx_includes_program(tx: dict, program_id: str) -> bool:
+    return program_id in tx_account_keys(tx)
+
+
+def parse_funding(tx: dict, creator: str):
+    """If this tx credited SOL to `creator`, return (funder, sol_amount).
+    The funder is the account whose balance dropped the most - robust for
+    plain transfers, CEX batch payouts, and program-routed sends alike."""
+    if not isinstance(tx, dict):
+        return None
+    keys = tx_account_keys(tx)
+    meta = tx.get("meta") or {}
+    pre = meta.get("preBalances") or []
+    post = meta.get("postBalances") or []
+    if len(pre) != len(keys) or len(post) != len(keys):
+        return None
+    try:
+        creator_index = keys.index(creator)
+    except ValueError:
+        return None
+    credited = post[creator_index] - pre[creator_index]
+    if credited <= 0:
+        return None
+    funder, biggest_drop = None, 0
+    for i, key in enumerate(keys):
+        if key == creator:
+            continue
+        drop = pre[i] - post[i]
+        if drop > biggest_drop:
+            biggest_drop, funder = drop, key
+    if funder is None:
+        return None
+    return funder, credited / 1e9
+
+
+async def profile_wallet(rpc: "Rpc", address: str, limit: int = 50):
+    """Cheap activity profile of a wallet: tx count (capped at `limit`),
+    whether the page was full (high-activity), and age when knowable."""
+    entries = await rpc.recent_signatures(address, limit)
+    if entries is None:
+        return None
+    count = len(entries)
+    page_full = count >= limit
+    age = None
+    if not page_full and entries:
+        block_time = entries[-1].get("blockTime")
+        if isinstance(block_time, (int, float)):
+            age = max(0.0, time.time() - float(block_time))
+    return {"count": count, "page_full": page_full, "age": age}
+
+
+def normalize_name(name) -> str:
+    """Lowercase and strip non-alphanumerics so 'Dog Wif Cap' == 'dogwifcap'."""
+    return re.sub(r"[^a-z0-9]", "", str(name or "").lower())
 
 
 # --------------------------------------------------------------------------
@@ -257,22 +375,31 @@ class Telegram:
         self.min_interval = max(0.5, min_interval)
         self.queue: asyncio.Queue = asyncio.Queue(maxsize=queue_size)
 
-    def enqueue(self, text: str):
+    def enqueue(self, text: str, buttons=None):
+        """Queue a message. `buttons` is an optional list of rows, each row
+        a list of (label, url) tuples shown as tappable inline buttons."""
         try:
-            self.queue.put_nowait(text)
+            self.queue.put_nowait((text, buttons))
         except asyncio.QueueFull:
             log.warning("Alert queue full - dropping an alert. "
                         "Tighten filters (MIN_DEV_BUY_SOL / FRESH_MAX_PRIOR_TXS).")
 
     async def run(self):
         while True:
-            text = await self.queue.get()
+            text, buttons = await self.queue.get()
             payload = {
                 "chat_id": self.chat_id,
                 "text": text,
                 "parse_mode": "HTML",
                 "disable_web_page_preview": True,
             }
+            if buttons:
+                payload["reply_markup"] = {
+                    "inline_keyboard": [
+                        [{"text": label, "url": url} for label, url in row]
+                        for row in buttons
+                    ]
+                }
             for attempt in range(3):
                 try:
                     async with self.session.post(
@@ -320,7 +447,65 @@ def dev_buy_sol(event: dict):
     return None
 
 
-def format_alert(event: dict, prior_count: int) -> str:
+def short_addr(address: str) -> str:
+    """Shortened address for display, e.g. 9acmq8..DqBy."""
+    if len(address) <= 12:
+        return address
+    return f"{address[:6]}..{address[-4:]}"
+
+
+def humanize_age(seconds: float) -> str:
+    """42s / 6m / 3h / 2d style age string."""
+    if seconds < 90:
+        return f"{int(seconds)}s"
+    minutes = seconds / 60
+    if minutes < 90:
+        return f"{int(minutes)}m"
+    hours = minutes / 60
+    if hours < 48:
+        return f"{int(hours)}h"
+    return f"{int(hours / 24)}d"
+
+
+def funding_lines(funding) -> list:
+    """Tree lines for the Funding section of an alert."""
+    if not funding:
+        return ["\u2514 Funding tx: not found"]
+    funder = funding["funder"]
+    lines = [
+        f"\u251C {funding['sol']:.2f} SOL from "
+        f'<a href="https://solscan.io/account/{funder}">'
+        f"{html.escape(short_addr(funder))}</a>"
+    ]
+    if funding.get("factory_flag"):
+        lines.append(
+            f"\u2514 \U0001F6A9 Funder bankrolled "
+            f"{funding['factory_count']} launch wallets"
+        )
+        return lines
+    profile = funding.get("profile")
+    if not profile:
+        lines.append("\u2514 Funder history: unavailable")
+    elif profile["page_full"]:
+        lines.append(f"\u2514 Funder: {profile['count']}+ txs (high-activity)")
+    else:
+        desc = f"{profile['count']} txs"
+        if profile["age"] is not None:
+            desc += f", {humanize_age(profile['age'])} old"
+        if (profile["count"] <= 20 and profile["age"] is not None
+                and profile["age"] < 48 * 3600):
+            desc += " \U0001F6A9 fresh funder"
+        lines.append(f"\u2514 Funder: {desc}")
+    return lines
+
+
+def format_alert(event: dict, prior_count: int, wallet_age,
+                 first_launch_verified: bool, funding=None, name_repeats=0):
+    """Build (message_html, inline_buttons) for a fresh-launch alert.
+
+    inline_buttons is a list of rows; each row is a list of (label, url)
+    tuples rendered as tappable Telegram buttons under the message.
+    """
     name = html.escape(str(event.get("name") or "Unknown"))
     symbol = html.escape(str(event.get("symbol") or "?"))
     mint = str(event.get("mint") or "")
@@ -328,38 +513,59 @@ def format_alert(event: dict, prior_count: int) -> str:
     signature = str(event.get("signature") or "")
     pool = str(event.get("pool") or "pump").lower()
 
-    lines = [
-        "\U0001F7E2 <b>Fresh wallet launch</b>",
-        f"<b>{name}</b> ({symbol}) \u2014 pool: {html.escape(pool)}",
-        f"CA: <code>{html.escape(mint)}</code>",
-        f"Creator: <code>{html.escape(creator)}</code> ({prior_count} prior txs)",
-    ]
+    deployer_lines = [f"\u251C {prior_count} prior txs"]
+    if wallet_age:
+        deployer_lines.append(f"\u251C Wallet age: {wallet_age}")
+    deployer_lines.append(
+        "\u2514 First pump.fun launch \u2705" if first_launch_verified
+        else "\u2514 Prior launches: unverified"
+    )
 
-    stats = []
+    deploy_stats = []
+    if name_repeats > 0:
+        deploy_stats.append(
+            f"\U0001F6A9 Name seen {name_repeats + 1}x in 24h"
+        )
     buy = dev_buy_sol(event)
     if buy is not None:
-        stats.append(f"Dev buy: {buy:.2f} SOL")
+        deploy_stats.append(f"Dev buy: {buy:.2f} SOL")
     market_cap = event.get("marketCapSol")
     if isinstance(market_cap, (int, float)):
-        stats.append(f"MC: {market_cap:.1f} SOL")
-    if stats:
-        lines.append(" | ".join(stats))
+        deploy_stats.append(f"MC: {market_cap:.1f} SOL")
 
-    links = []
+    lines = [
+        "\U0001F7E2 <b>FRESH WALLET LAUNCH</b>",
+        "",
+        f"<b>{name}</b> ({symbol}) \u2014 {html.escape(pool)}",
+        f"CA: <code>{html.escape(mint)}</code>",
+        "",
+        f"<b>Deployer</b> | "
+        f'<a href="https://solscan.io/account/{creator}">'
+        f"{html.escape(short_addr(creator))}</a>",
+        *deployer_lines,
+    ]
+    if deploy_stats:
+        lines += ["", "<b>Deploy</b>"]
+        lines += [
+            ("\u251C " if i < len(deploy_stats) - 1 else "\u2514 ") + stat
+            for i, stat in enumerate(deploy_stats)
+        ]
+
+    lines += ["", "<b>Funding</b>", *funding_lines(funding)]
+
+    buttons_row = []
     if pool == "pump" and mint:
-        links.append(f'<a href="https://pump.fun/coin/{mint}">pump.fun</a>')
-    if signature:
-        links.append(f'<a href="https://solscan.io/tx/{signature}">create tx</a>')
+        buttons_row.append(("pump.fun", f"https://pump.fun/coin/{mint}"))
     if mint:
-        links.append(f'<a href="https://gmgn.ai/sol/token/{mint}">gmgn</a>')
-    if links:
-        lines.append(" \u00B7 ".join(links))
+        buttons_row.append(("GMGN", f"https://gmgn.ai/sol/token/{mint}"))
+    if signature:
+        buttons_row.append(("Create tx", f"https://solscan.io/tx/{signature}"))
 
-    return "\n".join(lines)
+    return "\n".join(lines), ([buttons_row] if buttons_row else None)
 
 
 async def handle_event(event: dict, store: Store, rpc: Rpc,
-                       telegram: Telegram, cfg: Config):
+                       telegram: Telegram, cfg: Config, stats=None):
     mint = event.get("mint")
     creator = event.get("traderPublicKey")
     signature = event.get("signature")
@@ -372,6 +578,18 @@ async def handle_event(event: dict, store: Store, rpc: Rpc,
 
     if store.mint_alerted(mint):
         return
+
+    # Copycat-name tracking: log EVERY launch name so the 24h window sees
+    # the whole market, then suppress obvious metaspam waves early (free).
+    name_norm = normalize_name(event.get("name"))
+    name_hits = 0
+    if name_norm:
+        store.record_name(name_norm, mint)
+        name_hits = store.name_repeats(name_norm, mint)
+        if cfg.name_repeat_skip > 0 and name_hits + 1 >= cfg.name_repeat_skip:
+            log.info("Skip %s: name '%s' launched %d times in 24h",
+                     mint, event.get("name"), name_hits + 1)
+            return
 
     # Serial deployer we've already seen since the bot started running.
     if store.creator_seen(creator):
@@ -393,15 +611,16 @@ async def handle_event(event: dict, store: Store, rpc: Rpc,
     # hasn't indexed <sig> yet - which looks exactly like a fresh wallet
     # and produces false prior=0 results.
     page_limit = cfg.fresh_max_prior_txs + 5
-    sigs = None
+    entries = None
     create_index = None
     for attempt in range(4):
-        sigs = await rpc.recent_signatures(creator, page_limit)
-        if sigs is None:
+        entries = await rpc.recent_signatures(creator, page_limit)
+        if entries is None:
             log.warning("RPC failed for creator %s, skipping %s", creator[:8], mint)
             return
-        if signature in sigs:
-            create_index = sigs.index(signature)
+        sig_list = [entry["signature"] for entry in entries]
+        if signature in sig_list:
+            create_index = sig_list.index(signature)
             break
         # Node hasn't indexed the create tx yet - give it a moment.
         await asyncio.sleep(1.5 * (attempt + 1))
@@ -410,34 +629,82 @@ async def handle_event(event: dict, store: Store, rpc: Rpc,
                     "cannot verify freshness, skipping", mint)
         return
 
-    prior_sigs = sigs[create_index + 1:]
+    prior_entries = entries[create_index + 1:]
+    prior_sigs = [entry["signature"] for entry in prior_entries]
     prior_count = len(prior_sigs)
+
+    # Wallet age = time since the oldest visible tx. Wallets this fresh fit
+    # their whole history in one page, so this is the true wallet age.
+    oldest = prior_entries[-1] if prior_entries else entries[create_index]
+    oldest_time = oldest.get("blockTime")
+    wallet_age = None
+    if isinstance(oldest_time, (int, float)):
+        wallet_age = humanize_age(max(0.0, time.time() - float(oldest_time)))
     if prior_count > cfg.fresh_max_prior_txs:
         log.debug("Skip %s: creator has >%d prior txs", mint, cfg.fresh_max_prior_txs)
         return
 
+    prior_txs = {}
     if cfg.check_pumpfun_history and prior_count > 0:
         for sig in prior_sigs:
-            touched = await rpc.tx_touches_program(sig, PUMP_FUN_PROGRAM)
-            if touched:
+            tx = await rpc.get_transaction(sig)
+            prior_txs[sig] = tx
+            if tx is None:
+                # couldn't fetch; be permissive but log it.
+                log.debug("Could not verify prior tx %s for %s", sig[:16], creator[:8])
+                continue
+            if tx_includes_program(tx, PUMP_FUN_PROGRAM):
                 log.info("Skip %s: creator %s touched pump.fun before",
                          mint, creator[:8])
                 return
-            # touched is None -> couldn't fetch; be permissive but log it.
-            if touched is None:
-                log.debug("Could not verify prior tx %s for %s", sig[:16], creator[:8])
 
-    log.info("FRESH LAUNCH: %s (%s) mint=%s creator=%s prior=%d",
-             event.get("name"), event.get("symbol"), mint, creator, prior_count)
-    telegram.enqueue(format_alert(event, prior_count))
+    # --- Funding provenance ----------------------------------------------
+    # Walk the wallet's prior txs oldest-first and find who sent it SOL.
+    # Reuses transactions already fetched for the pump.fun history check.
+    funding = None
+    for entry in reversed(prior_entries):
+        sig = entry["signature"]
+        tx = prior_txs.get(sig)
+        if tx is None:
+            tx = await rpc.get_transaction(sig)
+        parsed = parse_funding(tx, creator) if tx else None
+        if parsed:
+            funder, sol_in = parsed
+            factory_count = store.record_funder(funder, creator)
+            funding = {
+                "funder": funder,
+                "sol": sol_in,
+                "factory_count": factory_count,
+                "factory_flag": factory_count >= cfg.funder_factory_threshold,
+                "profile": None,
+            }
+            break
+
+    if funding and funding["factory_flag"] and cfg.skip_factory_funded:
+        log.info("Skip %s: funder %s already bankrolled %d launch wallets",
+                 mint, short_addr(funding["funder"]), funding["factory_count"])
+        return
+
+    if funding and not funding["factory_flag"]:
+        funding["profile"] = await profile_wallet(rpc, funding["funder"])
+
+    first_verified = cfg.check_pumpfun_history or prior_count == 0
+    log.info("FRESH LAUNCH: %s (%s) mint=%s creator=%s prior=%d age=%s",
+             event.get("name"), event.get("symbol"), mint, creator,
+             prior_count, wallet_age or "?")
+    text, buttons = format_alert(event, prior_count, wallet_age, first_verified,
+                                 funding=funding, name_repeats=name_hits)
+    telegram.enqueue(text, buttons)
     store.remember_mint(mint)
+    if stats is not None:
+        stats.alerts += 1
 
 
-async def worker(events: asyncio.Queue, store, rpc, telegram, cfg):
+async def worker(events: asyncio.Queue, store, rpc, telegram, cfg, stats=None):
     while True:
         event = await events.get()
         try:
-            await handle_event(event, store, rpc, telegram, cfg)
+            await handle_event(event, store, rpc, telegram, cfg, stats)
         except Exception:
             log.exception("Unhandled error while processing event")
         finally:
@@ -445,10 +712,40 @@ async def worker(events: asyncio.Queue, store, rpc, telegram, cfg):
 
 
 # --------------------------------------------------------------------------
-# WebSocket loop with reconnect
+# WebSocket loop with reconnect + silence watchdog, and a heartbeat
 # --------------------------------------------------------------------------
 
-async def ws_loop(events: asyncio.Queue, cfg: Config):
+class Stats:
+    """Shared liveness counters for the heartbeat log line."""
+
+    def __init__(self):
+        self.connected = False
+        self.last_msg = None   # unix time of last websocket message
+        self.creates = 0       # create events seen
+        self.alerts = 0        # alerts actually sent
+
+
+async def heartbeat(stats: Stats, cfg: Config):
+    """Logs a liveness line so the logs are never ambiguously silent.
+    If these lines keep appearing, the bot is alive (just filtering).
+    If the logs stop entirely, the host has put the service to sleep."""
+    prev_creates = 0
+    while True:
+        await asyncio.sleep(cfg.heartbeat_secs)
+        if stats.last_msg is None:
+            last = "never"
+        else:
+            last = f"{int(time.time() - stats.last_msg)}s ago"
+        log.info(
+            "Heartbeat: feed=%s | last message %s | creates seen=%d (+%d) | "
+            "alerts sent=%d",
+            "connected" if stats.connected else "DISCONNECTED",
+            last, stats.creates, stats.creates - prev_creates, stats.alerts,
+        )
+        prev_creates = stats.creates
+
+
+async def ws_loop(events: asyncio.Queue, cfg: Config, stats: Stats):
     backoff = 5
     while True:
         try:
@@ -458,7 +755,21 @@ async def ws_loop(events: asyncio.Queue, cfg: Config):
                 await ws.send(json.dumps({"method": "subscribeNewToken"}))
                 log.info("Connected to %s - watching new token creates", cfg.ws_url)
                 backoff = 5
-                async for raw in ws:
+                stats.connected = True
+                while True:
+                    try:
+                        raw = await asyncio.wait_for(
+                            ws.recv(), timeout=cfg.ws_silence_timeout
+                        )
+                    except asyncio.TimeoutError:
+                        # pump.fun never goes this quiet; the connection is
+                        # dead even though it never errored. Reconnect.
+                        log.warning(
+                            "No data from feed for %ds - reconnecting (watchdog)",
+                            cfg.ws_silence_timeout,
+                        )
+                        break
+                    stats.last_msg = time.time()
                     try:
                         event = json.loads(raw)
                     except (TypeError, ValueError):
@@ -467,6 +778,7 @@ async def ws_loop(events: asyncio.Queue, cfg: Config):
                         continue
                     if event.get("txType") != "create":
                         continue
+                    stats.creates += 1
                     try:
                         events.put_nowait(event)
                     except asyncio.QueueFull:
@@ -477,6 +789,8 @@ async def ws_loop(events: asyncio.Queue, cfg: Config):
             log.warning("WebSocket dropped (%s). Reconnecting in %ds", exc, backoff)
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
+        stats.connected = False
+        await asyncio.sleep(1)
 
 
 # --------------------------------------------------------------------------
@@ -533,11 +847,16 @@ async def main():
             except Exception:
                 log.exception("Keep-alive server failed to start")
 
-        tasks = [asyncio.create_task(telegram.run(), name="telegram-sender")]
+        stats = Stats()
+        tasks = [
+            asyncio.create_task(telegram.run(), name="telegram-sender"),
+            asyncio.create_task(heartbeat(stats, cfg), name="heartbeat"),
+        ]
         for i in range(max(1, cfg.workers)):
             tasks.append(
                 asyncio.create_task(
-                    worker(events, store, rpc, telegram, cfg), name=f"worker-{i}"
+                    worker(events, store, rpc, telegram, cfg, stats),
+                    name=f"worker-{i}",
                 )
             )
 
@@ -547,7 +866,7 @@ async def main():
         )
 
         try:
-            await ws_loop(events, cfg)
+            await ws_loop(events, cfg, stats)
         finally:
             for task in tasks:
                 task.cancel()
