@@ -723,6 +723,10 @@ class TradeMonitor:
 async def handle_event(event: dict, store: Store, rpc: Rpc,
                        telegram: Telegram, cfg: Config, stats=None,
                        monitor=None):
+    def _skip(reason: str):
+        if stats is not None:
+            stats.skip(reason)
+
     mint = event.get("mint")
     creator = event.get("traderPublicKey")
     signature = event.get("signature")
@@ -731,11 +735,13 @@ async def handle_event(event: dict, store: Store, rpc: Rpc,
 
     pool = str(event.get("pool") or "pump").lower()
     if cfg.pools and pool not in cfg.pools:
+        _skip("pool")
         return
 
     # Free fast-path: if the feed ever labels mayhem launches directly.
     if cfg.skip_mayhem_mode and event.get("mayhemMode"):
         log.info("Skip %s: launched in mayhem mode (feed flag)", mint)
+        _skip("mayhem")
         return
 
     if store.mint_alerted(mint):
@@ -751,11 +757,13 @@ async def handle_event(event: dict, store: Store, rpc: Rpc,
         if cfg.name_repeat_skip > 0 and name_hits + 1 >= cfg.name_repeat_skip:
             log.info("Skip %s: name '%s' launched %d times in 24h",
                      mint, event.get("name"), name_hits + 1)
+            _skip("copycat")
             return
 
     # Serial deployer we've already seen since the bot started running.
     if store.creator_seen(creator):
         log.debug("Skip %s: creator %s already seen", mint, creator[:8])
+        _skip("repeat_creator")
         return
     store.remember_creator(creator, mint)
 
@@ -763,6 +771,7 @@ async def handle_event(event: dict, store: Store, rpc: Rpc,
     buy = dev_buy_sol(event)
     if cfg.min_dev_buy_sol > 0 and buy is not None and buy < cfg.min_dev_buy_sol:
         log.debug("Skip %s: dev buy %.3f < min %.3f", mint, buy, cfg.min_dev_buy_sol)
+        _skip("dev_buy")
         return
 
     # --- Freshness check -------------------------------------------------
@@ -779,6 +788,7 @@ async def handle_event(event: dict, store: Store, rpc: Rpc,
         entries = await rpc.recent_signatures(creator, page_limit)
         if entries is None:
             log.warning("RPC failed for creator %s, skipping %s", creator[:8], mint)
+            _skip("rpc_fail")
             return
         sig_list = [entry["signature"] for entry in entries]
         if signature in sig_list:
@@ -789,6 +799,7 @@ async def handle_event(event: dict, store: Store, rpc: Rpc,
     if create_index is None:
         log.warning("Create tx for %s not indexed after retries - "
                     "cannot verify freshness, skipping", mint)
+        _skip("not_indexed")
         return
 
     prior_entries = entries[create_index + 1:]
@@ -804,6 +815,7 @@ async def handle_event(event: dict, store: Store, rpc: Rpc,
         wallet_age = humanize_age(max(0.0, time.time() - float(oldest_time)))
     if prior_count > cfg.fresh_max_prior_txs:
         log.debug("Skip %s: creator has >%d prior txs", mint, cfg.fresh_max_prior_txs)
+        _skip("not_fresh")
         return
 
     # --- Mayhem-mode filter ----------------------------------------------
@@ -816,6 +828,7 @@ async def handle_event(event: dict, store: Store, rpc: Rpc,
                       mint)
         elif tx_includes_program(create_tx, MAYHEM_PROGRAM):
             log.info("Skip %s: launched in mayhem mode", mint)
+            _skip("mayhem")
             return
 
     prior_txs = {}
@@ -830,6 +843,7 @@ async def handle_event(event: dict, store: Store, rpc: Rpc,
             if tx_includes_program(tx, PUMP_FUN_PROGRAM):
                 log.info("Skip %s: creator %s touched pump.fun before",
                          mint, creator[:8])
+                _skip("prior_pumpfun")
                 return
 
     # --- Funding provenance ----------------------------------------------
@@ -852,12 +866,19 @@ async def handle_event(event: dict, store: Store, rpc: Rpc,
             # shared-funder count means nothing there - never suppress on
             # it, or every exchange-funded launch dies within hours.
             high_activity = bool(profile and profile.get("page_full"))
+            # If the profile lookup FAILED we don't know whether this is an
+            # exchange hot wallet - never suppress on unknown, or RPC
+            # hiccups silently re-enable the CEX false-positive.
+            factory_flag = (
+                factory_count >= cfg.funder_factory_threshold
+                and profile is not None
+                and not high_activity
+            )
             funding = {
                 "funder": funder,
                 "sol": sol_in,
                 "factory_count": factory_count,
-                "factory_flag": (factory_count >= cfg.funder_factory_threshold
-                                 and not high_activity),
+                "factory_flag": factory_flag,
                 "profile": profile,
             }
             break
@@ -865,6 +886,7 @@ async def handle_event(event: dict, store: Store, rpc: Rpc,
     if funding and funding["factory_flag"] and cfg.skip_factory_funded:
         log.info("Skip %s: funder %s already bankrolled %d launch wallets",
                  mint, short_addr(funding["funder"]), funding["factory_count"])
+        _skip("factory")
         return
 
     first_verified = cfg.check_pumpfun_history or prior_count == 0
@@ -898,13 +920,17 @@ async def worker(events: asyncio.Queue, store, rpc, telegram, cfg, stats=None,
 # --------------------------------------------------------------------------
 
 class Stats:
-    """Shared liveness counters for the heartbeat log line."""
+    """Shared liveness counters + skip funnel for the heartbeat line."""
 
     def __init__(self):
         self.connected = False
         self.last_msg = None   # unix time of last websocket message
         self.creates = 0       # create events seen
         self.alerts = 0        # alerts actually sent
+        self.skips = {}        # reason -> count (the decision funnel)
+
+    def skip(self, reason: str):
+        self.skips[reason] = self.skips.get(reason, 0) + 1
 
 
 async def heartbeat(stats: Stats, cfg: Config):
@@ -912,19 +938,30 @@ async def heartbeat(stats: Stats, cfg: Config):
     If these lines keep appearing, the bot is alive (just filtering).
     If the logs stop entirely, the host has put the service to sleep."""
     prev_creates = 0
+    prev_alerts = 0
+    prev_skips = {}
     while True:
         await asyncio.sleep(cfg.heartbeat_secs)
         if stats.last_msg is None:
             last = "never"
         else:
             last = f"{int(time.time() - stats.last_msg)}s ago"
+        deltas = []
+        for reason in sorted(stats.skips):
+            delta = stats.skips[reason] - prev_skips.get(reason, 0)
+            if delta:
+                deltas.append(f"{reason}={delta}")
+        funnel = " ".join(deltas) if deltas else "none"
         log.info(
-            "Heartbeat: feed=%s | last message %s | creates seen=%d (+%d) | "
-            "alerts sent=%d",
+            "Heartbeat: feed=%s | last message %s | creates=%d (+%d) | "
+            "alerts=%d (+%d) | skips this window: %s",
             "connected" if stats.connected else "DISCONNECTED",
-            last, stats.creates, stats.creates - prev_creates, stats.alerts,
+            last, stats.creates, stats.creates - prev_creates,
+            stats.alerts, stats.alerts - prev_alerts, funnel,
         )
         prev_creates = stats.creates
+        prev_alerts = stats.alerts
+        prev_skips = dict(stats.skips)
 
 
 async def ws_loop(events: asyncio.Queue, cfg: Config, stats: Stats,
