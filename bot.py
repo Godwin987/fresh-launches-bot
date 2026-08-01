@@ -112,6 +112,13 @@ class Config:
         # first 24h, 2B supply) - detected from the create transaction.
         self.skip_mayhem_mode = _env_bool("SKIP_MAYHEM_MODE", True)
 
+        # Stage-3 post-launch monitor: watch each alerted token's trades
+        # for this long, alert instantly if the dev sells, then post a
+        # scorecard (buys/sells, unique buyers, dev status, MC move).
+        self.monitor_secs = _env_int("MONITOR_SECS", 600)
+        self.monitor_max = _env_int("MONITOR_MAX", 10)
+        self.dev_sell_alerts = _env_bool("DEV_SELL_ALERTS", True)
+
         # Noise controls
         self.min_dev_buy_sol = _env_float("MIN_DEV_BUY_SOL", 0.0)
         self.pools = {
@@ -494,7 +501,10 @@ def funding_lines(funding) -> list:
     if not profile:
         lines.append("\u2514 Funder history: unavailable")
     elif profile["page_full"]:
-        lines.append(f"\u2514 Funder: {profile['count']}+ txs (high-activity)")
+        line = f"Funder: {profile['count']}+ txs (high-activity)"
+        if funding.get("factory_count", 0) >= 2:
+            line += f" \u00B7 funded {funding['factory_count']} fresh creators"
+        lines.append("\u2514 " + line)
     else:
         desc = f"{profile['count']} txs"
         if profile["age"] is not None:
@@ -571,8 +581,148 @@ def format_alert(event: dict, prior_count: int, wallet_age,
     return "\n".join(lines), ([buttons_row] if buttons_row else None)
 
 
+# --------------------------------------------------------------------------
+# Stage-3: post-launch trade monitor (dev sells, buyer quality, scorecard)
+# --------------------------------------------------------------------------
+
+def scorecard_message(mint: str, state: dict, window_secs: int):
+    """Build the end-of-window report for a monitored token."""
+    minutes = max(1, int(window_secs / 60))
+    buyers = state["buyers"]
+    unique = len(buyers)
+    top_share = 0
+    if state["buy_sol"] > 0 and buyers:
+        top_share = int(round(100 * max(buyers.values()) / state["buy_sol"]))
+    if state["dev_sold_sol"] > 0:
+        dev_line = f"\u251C Dev: sold {state['dev_sold_sol']:.2f} SOL \U0001F534"
+    else:
+        dev_line = "\u251C Dev: holding \u2705"
+    start_mc, last_mc = state.get("start_mc"), state.get("last_mc")
+    if isinstance(start_mc, (int, float)) and isinstance(last_mc, (int, float)):
+        mc_line = f"\u2514 MC: {start_mc:.1f} \u2192 {last_mc:.1f} SOL"
+    elif isinstance(last_mc, (int, float)):
+        mc_line = f"\u2514 MC: {last_mc:.1f} SOL"
+    else:
+        mc_line = "\u2514 MC: ?"
+    volume_line = f"\u251C Buy volume: {state['buy_sol']:.2f} SOL"
+    if top_share:
+        volume_line += f" (top buyer {top_share}%)"
+    text = "\n".join([
+        f"\U0001F50E <b>{minutes}-MIN REPORT</b> \u2014 "
+        f"<b>{html.escape(state['name'])}</b> "
+        f"({html.escape(state['symbol'])})",
+        f"CA: <code>{html.escape(mint)}</code>",
+        "",
+        f"\u251C Buys: {state['buys']} | Sells: {state['sells']}",
+        f"\u251C Unique buyers: {unique}",
+        volume_line,
+        dev_line,
+        mc_line,
+    ])
+    buttons = [[("pump.fun", f"https://pump.fun/coin/{mint}"),
+                ("GMGN", f"https://gmgn.ai/sol/token/{mint}")]]
+    return text, buttons
+
+
+class TradeMonitor:
+    """Watches each alerted token's trades (same PumpPortal socket) for
+    the first N minutes: instant alert if the dev sells, scorecard after."""
+
+    def __init__(self, telegram: Telegram, cfg: Config):
+        self.telegram = telegram
+        self.cfg = cfg
+        self.active = {}     # mint -> state dict
+        self.ws = None       # current websocket connection
+
+    def attach_ws(self, ws):
+        self.ws = ws
+
+    async def resubscribe(self):
+        """Re-subscribe all active mints after a reconnect."""
+        if self.ws is not None and self.active:
+            try:
+                await self.ws.send(json.dumps(
+                    {"method": "subscribeTokenTrade",
+                     "keys": list(self.active.keys())}))
+            except Exception:
+                pass
+
+    async def _send(self, method: str, mint: str):
+        if self.ws is None:
+            return
+        try:
+            await self.ws.send(json.dumps({"method": method, "keys": [mint]}))
+        except Exception:
+            pass
+
+    async def watch(self, event: dict):
+        mint = event.get("mint")
+        if not mint or mint in self.active:
+            return
+        if len(self.active) >= self.cfg.monitor_max:
+            log.debug("Monitor cap reached - not watching %s", mint)
+            return
+        self.active[mint] = {
+            "name": str(event.get("name") or "Unknown"),
+            "symbol": str(event.get("symbol") or "?"),
+            "creator": str(event.get("traderPublicKey") or ""),
+            "start_mc": event.get("marketCapSol"),
+            "last_mc": event.get("marketCapSol"),
+            "started": time.time(),
+            "buys": 0, "sells": 0,
+            "buyers": {},
+            "buy_sol": 0.0, "sell_sol": 0.0,
+            "dev_sold_sol": 0.0, "dev_alerted": False,
+        }
+        await self._send("subscribeTokenTrade", mint)
+        asyncio.create_task(self._finish(mint))
+
+    async def _finish(self, mint: str):
+        await asyncio.sleep(self.cfg.monitor_secs)
+        state = self.active.pop(mint, None)
+        await self._send("unsubscribeTokenTrade", mint)
+        if state:
+            self.telegram.enqueue(
+                *scorecard_message(mint, state, self.cfg.monitor_secs))
+
+    def on_trade(self, event: dict):
+        """Called from the websocket loop for every buy/sell event."""
+        mint = event.get("mint")
+        state = self.active.get(mint)
+        if state is None:
+            return
+        tx_type = event.get("txType")
+        trader = str(event.get("traderPublicKey") or "")
+        sol = event.get("solAmount")
+        sol = float(sol) if isinstance(sol, (int, float)) else 0.0
+        market_cap = event.get("marketCapSol")
+        if isinstance(market_cap, (int, float)):
+            state["last_mc"] = market_cap
+        if tx_type == "buy":
+            state["buys"] += 1
+            state["buy_sol"] += sol
+            state["buyers"][trader] = state["buyers"].get(trader, 0.0) + sol
+        elif tx_type == "sell":
+            state["sells"] += 1
+            state["sell_sol"] += sol
+            if trader and trader == state["creator"]:
+                state["dev_sold_sol"] += sol
+                if not state["dev_alerted"] and self.cfg.dev_sell_alerts:
+                    state["dev_alerted"] = True
+                    elapsed = humanize_age(time.time() - state["started"])
+                    self.telegram.enqueue(
+                        "\U0001F534 <b>DEV SOLD</b> \u2014 "
+                        f"<b>{html.escape(state['name'])}</b> "
+                        f"({html.escape(state['symbol'])})\n"
+                        f"\u251C {sol:.2f} SOL out, {elapsed} after launch\n"
+                        f"\u2514 CA: <code>{html.escape(mint)}</code>",
+                        [[("GMGN", f"https://gmgn.ai/sol/token/{mint}")]],
+                    )
+
+
 async def handle_event(event: dict, store: Store, rpc: Rpc,
-                       telegram: Telegram, cfg: Config, stats=None):
+                       telegram: Telegram, cfg: Config, stats=None,
+                       monitor=None):
     mint = event.get("mint")
     creator = event.get("traderPublicKey")
     signature = event.get("signature")
@@ -695,12 +845,20 @@ async def handle_event(event: dict, store: Store, rpc: Rpc,
         if parsed:
             funder, sol_in = parsed
             factory_count = store.record_funder(funder, creator)
+            profile = await profile_wallet(rpc, funder)
+            # A "factory" is one ORDINARY wallet bankrolling several fresh
+            # creators. High-activity funders (CEX hot wallets, big payout
+            # wallets) fund thousands of unrelated wallets every day, so a
+            # shared-funder count means nothing there - never suppress on
+            # it, or every exchange-funded launch dies within hours.
+            high_activity = bool(profile and profile.get("page_full"))
             funding = {
                 "funder": funder,
                 "sol": sol_in,
                 "factory_count": factory_count,
-                "factory_flag": factory_count >= cfg.funder_factory_threshold,
-                "profile": None,
+                "factory_flag": (factory_count >= cfg.funder_factory_threshold
+                                 and not high_activity),
+                "profile": profile,
             }
             break
 
@@ -708,9 +866,6 @@ async def handle_event(event: dict, store: Store, rpc: Rpc,
         log.info("Skip %s: funder %s already bankrolled %d launch wallets",
                  mint, short_addr(funding["funder"]), funding["factory_count"])
         return
-
-    if funding and not funding["factory_flag"]:
-        funding["profile"] = await profile_wallet(rpc, funding["funder"])
 
     first_verified = cfg.check_pumpfun_history or prior_count == 0
     log.info("FRESH LAUNCH: %s (%s) mint=%s creator=%s prior=%d age=%s",
@@ -722,13 +877,16 @@ async def handle_event(event: dict, store: Store, rpc: Rpc,
     store.remember_mint(mint)
     if stats is not None:
         stats.alerts += 1
+    if monitor is not None:
+        await monitor.watch(event)
 
 
-async def worker(events: asyncio.Queue, store, rpc, telegram, cfg, stats=None):
+async def worker(events: asyncio.Queue, store, rpc, telegram, cfg, stats=None,
+                 monitor=None):
     while True:
         event = await events.get()
         try:
-            await handle_event(event, store, rpc, telegram, cfg, stats)
+            await handle_event(event, store, rpc, telegram, cfg, stats, monitor)
         except Exception:
             log.exception("Unhandled error while processing event")
         finally:
@@ -769,7 +927,8 @@ async def heartbeat(stats: Stats, cfg: Config):
         prev_creates = stats.creates
 
 
-async def ws_loop(events: asyncio.Queue, cfg: Config, stats: Stats):
+async def ws_loop(events: asyncio.Queue, cfg: Config, stats: Stats,
+                  monitor=None):
     backoff = 5
     while True:
         try:
@@ -780,6 +939,9 @@ async def ws_loop(events: asyncio.Queue, cfg: Config, stats: Stats):
                 log.info("Connected to %s - watching new token creates", cfg.ws_url)
                 backoff = 5
                 stats.connected = True
+                if monitor is not None:
+                    monitor.attach_ws(ws)
+                    await monitor.resubscribe()
                 while True:
                     try:
                         raw = await asyncio.wait_for(
@@ -800,7 +962,12 @@ async def ws_loop(events: asyncio.Queue, cfg: Config, stats: Stats):
                         continue
                     if not isinstance(event, dict):
                         continue
-                    if event.get("txType") != "create":
+                    tx_type = event.get("txType")
+                    if tx_type in ("buy", "sell"):
+                        if monitor is not None:
+                            monitor.on_trade(event)
+                        continue
+                    if tx_type != "create":
                         continue
                     stats.creates += 1
                     try:
@@ -872,6 +1039,7 @@ async def main():
                 log.exception("Keep-alive server failed to start")
 
         stats = Stats()
+        monitor = TradeMonitor(telegram, cfg)
         tasks = [
             asyncio.create_task(telegram.run(), name="telegram-sender"),
             asyncio.create_task(heartbeat(stats, cfg), name="heartbeat"),
@@ -879,7 +1047,7 @@ async def main():
         for i in range(max(1, cfg.workers)):
             tasks.append(
                 asyncio.create_task(
-                    worker(events, store, rpc, telegram, cfg, stats),
+                    worker(events, store, rpc, telegram, cfg, stats, monitor),
                     name=f"worker-{i}",
                 )
             )
@@ -890,7 +1058,7 @@ async def main():
         )
 
         try:
-            await ws_loop(events, cfg, stats)
+            await ws_loop(events, cfg, stats, monitor)
         finally:
             for task in tasks:
                 task.cancel()

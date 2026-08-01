@@ -29,6 +29,20 @@ launches are suppressed (`SKIP_FACTORY_FUNDED`). The funder graph lives in
 SQLite and gets smarter the longer it runs — note that on hosts without a
 persistent disk (e.g. Render free tier) it resets on each deploy.
 
+**Post-launch monitor (v3):** every alerted token is watched for its first
+10 minutes on the same PumpPortal socket. If the creator wallet sells, you
+get an instant 🔴 DEV SOLD alert. When the window closes, a scorecard
+follows: buys/sells, unique buyers, buy volume with top-buyer share, dev
+status, and market-cap move. Note the monitor tracks the creator wallet
+only — a dev who pre-transfers tokens to another wallet and dumps from
+there won't trip the instant alert (the sell still shows in the counts).
+
+**Factory funders vs exchanges:** the funder->creator graph only suppresses
+launches when the shared funder is an ordinary (low-activity) wallet.
+High-activity funders like exchange hot wallets bankroll thousands of
+unrelated wallets a day, so they are never treated as factories — the
+alert simply shows how many fresh creators they've funded.
+
 **Mayhem-mode filter (v2):** pump.fun's mayhem mode has an AI agent trade
 the coin's first 24h on a doubled (2B) supply, so the early tape is partly
 synthetic. Mayhem is fixed at creation and routes through its own on-chain
