@@ -110,7 +110,16 @@ class Config:
 
         # Skip launches created in pump.fun mayhem mode (AI-agent-traded
         # first 24h, 2B supply) - detected from the create transaction.
-        self.skip_mayhem_mode = _env_bool("SKIP_MAYHEM_MODE", True)
+        # skip = suppress mayhem launches, flag = alert with a mayhem tag,
+        # off = don't check at all (saves one RPC call per candidate).
+        action = _env_str("MAYHEM_MODE_ACTION", "skip").lower()
+        self.mayhem_action = action if action in ("skip", "flag", "off") else "skip"
+        # Legacy switch: SKIP_MAYHEM_MODE=false means "don't suppress".
+        if not _env_bool("SKIP_MAYHEM_MODE", True) and self.mayhem_action == "skip":
+            self.mayhem_action = "flag"
+        # How many times to re-poll the RPC for the create tx before falling
+        # back to counting the wallet's visible txs as priors.
+        self.index_retries = _env_int("INDEX_RETRIES", 3)
 
         # Stage-3 post-launch monitor: watch each alerted token's trades
         # for this long, alert instantly if the dev sells, then post a
@@ -128,8 +137,8 @@ class Config:
         }
 
         # Plumbing
-        self.rpc_concurrency = _env_int("RPC_CONCURRENCY", 4)
-        self.workers = _env_int("WORKERS", 4)
+        self.rpc_concurrency = _env_int("RPC_CONCURRENCY", 8)
+        self.workers = _env_int("WORKERS", 10)
         self.alert_min_interval = _env_float("ALERT_MIN_INTERVAL", 3.0)
         self.alert_queue_size = _env_int("ALERT_QUEUE_SIZE", 25)
         self.event_queue_size = _env_int("EVENT_QUEUE_SIZE", 300)
@@ -138,6 +147,10 @@ class Config:
         self.ws_silence_timeout = _env_int("WS_SILENCE_TIMEOUT", 120)
         # Log a liveness line this often so "is it running?" is answerable.
         self.heartbeat_secs = _env_int("HEARTBEAT_SECS", 180)
+        # Send a funnel summary to Telegram this often, in minutes, so the
+        # "why am I not getting alerts?" answer lands on your phone.
+        # 0 disables it.
+        self.funnel_report_mins = _env_int("FUNNEL_REPORT_MINS", 60)
         self.log_level = _env_str("LOG_LEVEL", "INFO").upper()
 
     def validate(self):
@@ -517,7 +530,8 @@ def funding_lines(funding) -> list:
 
 
 def format_alert(event: dict, prior_count: int, wallet_age,
-                 first_launch_verified: bool, funding=None, name_repeats=0):
+                 first_launch_verified: bool, funding=None, name_repeats=0,
+                 is_mayhem=False, approx_priors=False):
     """Build (message_html, inline_buttons) for a fresh-launch alert.
 
     inline_buttons is a list of rows; each row is a list of (label, url)
@@ -530,7 +544,10 @@ def format_alert(event: dict, prior_count: int, wallet_age,
     signature = str(event.get("signature") or "")
     pool = str(event.get("pool") or "pump").lower()
 
-    deployer_lines = [f"\u251C {prior_count} prior txs"]
+    prior_label = f"{prior_count} prior txs"
+    if approx_priors:
+        prior_label += " (approx)"
+    deployer_lines = [f"\u251C {prior_label}"]
     if wallet_age:
         deployer_lines.append(f"\u251C Wallet age: {wallet_age}")
     deployer_lines.append(
@@ -539,6 +556,8 @@ def format_alert(event: dict, prior_count: int, wallet_age,
     )
 
     deploy_stats = []
+    if is_mayhem:
+        deploy_stats.append("\u26A1 Mayhem mode")
     if name_repeats > 0:
         deploy_stats.append(
             f"\U0001F6A9 Name seen {name_repeats + 1}x in 24h"
@@ -739,7 +758,7 @@ async def handle_event(event: dict, store: Store, rpc: Rpc,
         return
 
     # Free fast-path: if the feed ever labels mayhem launches directly.
-    if cfg.skip_mayhem_mode and event.get("mayhemMode"):
+    if cfg.mayhem_action == "skip" and event.get("mayhemMode"):
         log.info("Skip %s: launched in mayhem mode (feed flag)", mint)
         _skip("mayhem")
         return
@@ -784,7 +803,7 @@ async def handle_event(event: dict, store: Store, rpc: Rpc,
     page_limit = cfg.fresh_max_prior_txs + 5
     entries = None
     create_index = None
-    for attempt in range(4):
+    for attempt in range(cfg.index_retries):
         entries = await rpc.recent_signatures(creator, page_limit)
         if entries is None:
             log.warning("RPC failed for creator %s, skipping %s", creator[:8], mint)
@@ -795,14 +814,27 @@ async def handle_event(event: dict, store: Store, rpc: Rpc,
             create_index = sig_list.index(signature)
             break
         # Node hasn't indexed the create tx yet - give it a moment.
-        await asyncio.sleep(1.5 * (attempt + 1))
-    if create_index is None:
-        log.warning("Create tx for %s not indexed after retries - "
-                    "cannot verify freshness, skipping", mint)
-        _skip("not_indexed")
-        return
+        if attempt < cfg.index_retries - 1:
+            await asyncio.sleep(1.0 * (attempt + 1))
 
-    prior_entries = entries[create_index + 1:]
+    approx = False
+    if create_index is None:
+        # The create tx still isn't indexed. That does NOT mean we're blind:
+        # the list is newest-first and the create tx is the newest thing this
+        # wallet has done, so everything returned is necessarily EARLIER than
+        # it - i.e. the whole list is prior txs. Only bail if the page came
+        # back full, where we genuinely can't see the wallet's full history.
+        if len(entries) >= page_limit:
+            log.debug("Skip %s: creator page full and create tx unindexed", mint)
+            _skip("not_fresh")
+            return
+        approx = True
+        prior_entries = entries
+        log.debug("Create tx for %s not indexed yet - counting %d visible "
+                  "txs as priors", mint, len(entries))
+    else:
+        prior_entries = entries[create_index + 1:]
+
     prior_sigs = [entry["signature"] for entry in prior_entries]
     prior_count = len(prior_sigs)
 
@@ -821,15 +853,18 @@ async def handle_event(event: dict, store: Store, rpc: Rpc,
     # --- Mayhem-mode filter ----------------------------------------------
     # Mayhem launches route through the Mayhem program; since the mode is
     # fixed at creation, the create tx must list that program's ID.
-    if cfg.skip_mayhem_mode:
+    is_mayhem = False
+    if cfg.mayhem_action != "off":
         create_tx = await rpc.get_transaction(signature)
         if create_tx is None:
             log.debug("Could not fetch create tx for %s (mayhem check skipped)",
                       mint)
         elif tx_includes_program(create_tx, MAYHEM_PROGRAM):
-            log.info("Skip %s: launched in mayhem mode", mint)
-            _skip("mayhem")
-            return
+            is_mayhem = True
+            if cfg.mayhem_action == "skip":
+                log.info("Skip %s: launched in mayhem mode", mint)
+                _skip("mayhem")
+                return
 
     prior_txs = {}
     if cfg.check_pumpfun_history and prior_count > 0:
@@ -894,7 +929,8 @@ async def handle_event(event: dict, store: Store, rpc: Rpc,
              event.get("name"), event.get("symbol"), mint, creator,
              prior_count, wallet_age or "?")
     text, buttons = format_alert(event, prior_count, wallet_age, first_verified,
-                                 funding=funding, name_repeats=name_hits)
+                                 funding=funding, name_repeats=name_hits,
+                                 is_mayhem=is_mayhem, approx_priors=approx)
     telegram.enqueue(text, buttons)
     store.remember_mint(mint)
     if stats is not None:
@@ -927,6 +963,7 @@ class Stats:
         self.last_msg = None   # unix time of last websocket message
         self.creates = 0       # create events seen
         self.alerts = 0        # alerts actually sent
+        self.dropped = 0       # create events dropped (workers fell behind)
         self.skips = {}        # reason -> count (the decision funnel)
 
     def skip(self, reason: str):
@@ -961,6 +998,61 @@ async def heartbeat(stats: Stats, cfg: Config):
         )
         prev_creates = stats.creates
         prev_alerts = stats.alerts
+        prev_skips = dict(stats.skips)
+
+
+SKIP_LABELS = {
+    "pool": "wrong pool",
+    "mayhem": "mayhem mode",
+    "copycat": "copycat name",
+    "repeat_creator": "creator already seen",
+    "dev_buy": "dev buy too small",
+    "rpc_fail": "RPC failed",
+    "not_fresh": "wallet not fresh",
+    "prior_pumpfun": "used pump.fun before",
+    "factory": "factory funder",
+}
+
+
+async def funnel_reporter(stats: Stats, telegram: Telegram, cfg: Config):
+    """Periodically pushes the decision funnel to Telegram: how many
+    launches were seen, how many alerted, and exactly what killed the rest."""
+    if cfg.funnel_report_mins <= 0:
+        return
+    interval = cfg.funnel_report_mins * 60
+    prev_creates = prev_alerts = prev_dropped = 0
+    prev_skips: dict = {}
+    while True:
+        await asyncio.sleep(interval)
+        creates = stats.creates - prev_creates
+        alerts = stats.alerts - prev_alerts
+        dropped = stats.dropped - prev_dropped
+        rows = []
+        for reason, total in stats.skips.items():
+            delta = total - prev_skips.get(reason, 0)
+            if delta:
+                rows.append((delta, SKIP_LABELS.get(reason, reason)))
+        rows.sort(reverse=True)
+
+        lines = [
+            f"\U0001F4CA <b>Last {cfg.funnel_report_mins} min</b>",
+            f"\u251C Launches seen: {creates}",
+            f"\u2514 Alerts sent: {alerts}",
+        ]
+        if rows:
+            lines.append("")
+            lines.append("<b>Filtered out</b>")
+            for i, (count, label) in enumerate(rows):
+                branch = "\u251C " if i < len(rows) - 1 else "\u2514 "
+                lines.append(f"{branch}{label}: {count}")
+        if dropped:
+            lines.append("")
+            lines.append(f"\u26A0\uFE0F {dropped} launches dropped (workers "
+                         "behind - raise WORKERS)")
+        telegram.enqueue("\n".join(lines))
+
+        prev_creates, prev_alerts = stats.creates, stats.alerts
+        prev_dropped = stats.dropped
         prev_skips = dict(stats.skips)
 
 
@@ -1010,6 +1102,7 @@ async def ws_loop(events: asyncio.Queue, cfg: Config, stats: Stats,
                     try:
                         events.put_nowait(event)
                     except asyncio.QueueFull:
+                        stats.dropped += 1
                         log.warning("Event queue full - dropping a create event")
         except asyncio.CancelledError:
             raise
@@ -1080,6 +1173,8 @@ async def main():
         tasks = [
             asyncio.create_task(telegram.run(), name="telegram-sender"),
             asyncio.create_task(heartbeat(stats, cfg), name="heartbeat"),
+            asyncio.create_task(funnel_reporter(stats, telegram, cfg),
+                                name="funnel-reporter"),
         ]
         for i in range(max(1, cfg.workers)):
             tasks.append(
