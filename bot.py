@@ -107,6 +107,9 @@ class Config:
         # Suppress a launch if its (normalized) name already launched this
         # many times in the last 24h. 0 disables the skip (flag only).
         self.name_repeat_skip = _env_int("NAME_REPEAT_SKIP", 3)
+        # How far back the copycat check looks. A full day bans common meme
+        # words outright; a few hours still catches live spam waves.
+        self.name_window_mins = _env_int("NAME_WINDOW_MINS", 240)
 
         # Skip launches created in pump.fun mayhem mode (AI-agent-traded
         # first 24h, 2B supply) - detected from the create transaction.
@@ -235,21 +238,22 @@ class Store:
         ).fetchone()
         return int(row[0]) if row else 1
 
-    def record_name(self, name_norm: str, mint: str):
-        """Log a launch name (normalized) and prune entries older than 24h."""
+    def record_name(self, name_norm: str, mint: str, window_secs: int = 86400):
+        """Log a launch name (normalized) and prune entries past the window."""
         now = int(time.time())
-        self.db.execute("DELETE FROM names WHERE ts < ?", (now - 86400,))
+        self.db.execute("DELETE FROM names WHERE ts < ?", (now - window_secs,))
         self.db.execute(
             "INSERT INTO names (name, mint, ts) VALUES (?, ?, ?)",
             (name_norm, mint, now),
         )
         self.db.commit()
 
-    def name_repeats(self, name_norm: str, mint: str) -> int:
-        """How many OTHER launches used this name in the last 24h."""
+    def name_repeats(self, name_norm: str, mint: str,
+                     window_secs: int = 86400) -> int:
+        """How many OTHER launches used this name inside the window."""
         row = self.db.execute(
-            "SELECT COUNT(*) FROM names WHERE name = ? AND mint != ?",
-            (name_norm, mint),
+            "SELECT COUNT(*) FROM names WHERE name = ? AND mint != ? AND ts >= ?",
+            (name_norm, mint, int(time.time()) - window_secs),
         ).fetchone()
         return int(row[0]) if row else 0
 
@@ -559,9 +563,7 @@ def format_alert(event: dict, prior_count: int, wallet_age,
     if is_mayhem:
         deploy_stats.append("\u26A1 Mayhem mode")
     if name_repeats > 0:
-        deploy_stats.append(
-            f"\U0001F6A9 Name seen {name_repeats + 1}x in 24h"
-        )
+        deploy_stats.append(f"\U0001F6A9 Name seen {name_repeats + 1}x recently")
     buy = dev_buy_sol(event)
     if buy is not None:
         deploy_stats.append(f"Dev buy: {buy:.2f} SOL")
@@ -771,11 +773,13 @@ async def handle_event(event: dict, store: Store, rpc: Rpc,
     name_norm = normalize_name(event.get("name"))
     name_hits = 0
     if name_norm:
-        store.record_name(name_norm, mint)
-        name_hits = store.name_repeats(name_norm, mint)
+        window = cfg.name_window_mins * 60
+        store.record_name(name_norm, mint, window)
+        name_hits = store.name_repeats(name_norm, mint, window)
         if cfg.name_repeat_skip > 0 and name_hits + 1 >= cfg.name_repeat_skip:
-            log.info("Skip %s: name '%s' launched %d times in 24h",
-                     mint, event.get("name"), name_hits + 1)
+            log.info("Skip %s: name '%s' launched %d times in %dm",
+                     mint, event.get("name"), name_hits + 1,
+                     cfg.name_window_mins)
             _skip("copycat")
             return
 
